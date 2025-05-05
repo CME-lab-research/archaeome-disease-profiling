@@ -1,0 +1,3 @@
+GCF_000016525.1_ASM1652v1_genomic.xml,0.3738
+IHE3034_Ecoli_pks.xml,0.6262
+

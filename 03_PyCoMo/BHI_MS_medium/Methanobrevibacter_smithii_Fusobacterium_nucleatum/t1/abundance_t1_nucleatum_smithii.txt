@@ -1,0 +1,3 @@
+GCF_000016525.1_ASM1652v1_genomic.xml,0.1155
+GCA_003019295.1_ASM301929v1_Fusobacterium_nucleatum.xml,0.8845
+

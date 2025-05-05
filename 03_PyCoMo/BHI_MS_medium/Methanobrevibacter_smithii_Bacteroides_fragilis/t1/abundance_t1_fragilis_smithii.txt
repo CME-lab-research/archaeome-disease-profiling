@@ -1,0 +1,3 @@
+GCF_000016525.1_ASM1652v1_genomic.xml,0.0780
+GCA_000025985.1_ASM2598v1_Bacteroides_fragilis.xml,0.921
+

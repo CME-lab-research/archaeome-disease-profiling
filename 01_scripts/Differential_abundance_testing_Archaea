@@ -1,0 +1,131 @@
+# Load required libraries
+library(tidyverse)
+library(readr)
+library(tibble)
+library(tidyr)
+library(purrr)
+library(broom)
+library(pheatmap)
+library(plotly)
+library(compositions)
+library(ggpubr)
+
+# Define file paths
+bracken_file <- "Bracken_species_MMuphin_all_samples_final.txt"
+metadata_file <- "metadata_CRC_all_State_only.txt"
+
+# Read the data
+bracken_data <- read_tsv(bracken_file, show_col_types = FALSE) %>%
+  column_to_rownames(var = "...1") %>%
+  as.data.frame()
+
+metadata <- read.delim(metadata_file, check.names = FALSE)
+
+# Step 1: Calculate Relative Abundance
+bracken_relative <- apply(bracken_data, 2, function(x) x / sum(x)) %>%
+  as.data.frame()
+bracken_relative$Taxa <- rownames(bracken_data)
+
+# Step 2: Remove taxa with zero sum before CLR transformation
+row_sums <- rowSums(bracken_relative[, -ncol(bracken_relative)])
+bracken_relative <- bracken_relative[row_sums != 0, ]
+
+# Step 3: Add pseudocount (+1) before CLR transformation
+bracken_relative[, -ncol(bracken_relative)] <- bracken_relative[, -ncol(bracken_relative)] + 1
+
+# Step 4: Apply CLR Transformation
+bracken_clr <- clr(bracken_relative[, -ncol(bracken_relative)]) %>%
+  as.data.frame()
+bracken_clr$Taxa <- bracken_relative$Taxa
+
+# Step 5: Convert to long format & merge with metadata
+bracken_clr_long <- bracken_clr %>%
+  pivot_longer(cols = -Taxa, names_to = "SRA_ID", values_to = "CLR_value") %>%
+  left_join(metadata, by = "SRA_ID")
+
+# Step 6: Filter for specified archaeal taxa
+specified_taxa <- c("Methanobrevibacter_A_sp900766745", "Methanobrevibacter_A_smithii", 
+                    "Methanosphaera_sp900322125", "Methanobrevibacter_A_woesei", 
+                    "Methanobrevibacter_A_smithii_A")
+
+bracken_clr_long <- bracken_clr_long %>%
+  filter(str_detect(Taxa, paste0(specified_taxa, "$", collapse = "|")))
+
+# Step 7: Remove taxa present in only one group
+valid_taxa <- bracken_clr_long %>%
+  group_by(Taxa) %>%
+  summarise(groups = n_distinct(State), .groups = "drop") %>%
+  filter(groups == 2) %>%
+  pull(Taxa)
+
+bracken_clr_long <- bracken_clr_long %>%
+  filter(Taxa %in% valid_taxa)
+
+# Step 8: Extract species names
+bracken_clr_long <- bracken_clr_long %>%
+  mutate(Species = str_extract(Taxa, "s__.*")) %>%
+  filter(!is.na(Species))
+
+# Step 9: Compute p-values and BH-adjusted p-values
+test_results <- bracken_clr_long %>%
+  group_by(Species) %>%
+  filter(n() >= 3) %>%
+  summarise(
+    p_value = ifelse(
+      shapiro.test(CLR_value)$p.value > 0.05,
+      t.test(CLR_value ~ State)$p.value,
+      wilcox.test(CLR_value ~ State)$p.value
+    ),
+    test_used = ifelse(
+      shapiro.test(CLR_value)$p.value > 0.05, "t-test", "Wilcoxon"
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(adj_p_value = p.adjust(p_value, method = "BH"))
+
+# Step 10: Merge test results into main dataset
+bracken_clr_long <- bracken_clr_long %>%
+  left_join(test_results, by = "Species")
+
+# Step 11: Transform CLR values for visualization
+bracken_clr_long <- bracken_clr_long %>%
+  mutate(log_CLR_value = log10(CLR_value))
+
+# Step 12: Determine max value per species for p-value label placement
+y_max <- bracken_clr_long %>%
+  group_by(Species) %>%
+  summarize(y_pos = max(log_CLR_value, na.rm = TRUE) + 0.5, .groups = "drop")
+
+bracken_clr_long <- bracken_clr_long %>%
+  left_join(y_max, by = "Species")
+
+# Step 13: Create and save the boxplot
+if (nrow(bracken_clr_long) > 0) {
+  p <- ggplot(bracken_clr_long, aes(x = State, y = log_CLR_value, fill = State)) +
+    geom_boxplot(alpha = 0.7) +
+    facet_wrap(~ Species, scales = "free", ncol = 3) +
+    geom_text(
+      data = bracken_clr_long %>% distinct(Species, .keep_all = TRUE),
+      aes(x = 1.5, y = y_pos + 0.2, label = sprintf("adj p = %.3g", adj_p_value)),
+      size = 5
+    ) +
+    theme_minimal() +
+    labs(
+      title = "Differential Abundance of Selected Methanogens",
+      y = "log10(CLR-Transformed Abundance)",
+      x = "State (Case/Control)"
+    ) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  print(p)
+  
+  ggsave("Bracken_species_MMuphin_all_samples_final_abundant.png", plot = p, width = 10, height = 6, dpi = 300)
+} else {
+  message("No data available after filtering. Check filtering criteria.")
+}
+
+# Step 14: Save p-values to a file
+write.csv(test_results, file = "Bracken_species_MMuphin_all_samples_final_abundant.csv", row.names = FALSE)
+
+# Optional: Save final CLR transformed matrix
+# write.csv(bracken_clr, file = "final_clr_selected_taxa.csv", row.names = TRUE)

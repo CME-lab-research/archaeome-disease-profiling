@@ -1,0 +1,226 @@
+#!/usr/bin/env Rscript
+# ================================================================
+# Co-occurrence: M. smithii vs ALL taxa
+#  - Single-row stacked bars (Control vs CRC) per taxon
+#  - Labels: OR [95% CI] & q (BH) inside panels; % labels only in first facet
+#  - Color-blind–friendly Okabe–Ito palette
+#  - Y-axis fixed to 0–100%
+# ================================================================
+
+# -------------------- SETTINGS ----------------------------------
+
+presence_threshold <- 0               # abundance > this => present
+min_prevalence <- 0                   # drop taxa with prevalence < this in ALL (0–1)
+
+# Figure sizing and output
+save_width_per_facet <- 2.0           # inches per facet; adjust if crowded
+save_height <- 6.0                    # inches (single-row layout)
+dpi_out <- 300
+
+# Desired facet order (robust partial matching; case-insensitive)
+# Exact order requested:
+desired_order_patterns <- c(
+  "Fusobacterium[_ ]?nucleatum|^Fusobacterium$",
+  "Bacteroides[_ ]?fragilis|fragilis",
+  "E.*coli.*D|EcoliD|Escherichia[_ ]?coli.*D",
+  "Akkermansia[_ ]?muciniphila|akkermansia muciniphila",
+  "symbiosum|symbiosa|Clostridium[_ ]?Q[_ ]?symbiosum",
+  "Gemella[_ ]?morbillorum|gemella",
+  "Parvimonas|parviromonas",
+  "Parvimonas[_ ]?micra|\\bmicra\\b",
+  "Porphyromonas[_ ]?asaccharolytica|assaccharolytica|asaccharolytica",
+  "Peptostreptococcus[_ ]?stomatis|stomatis",
+  "Prevotella[_ ]?intermedia|itermedia|intermedia",
+  "Ruminococcus[_ ]?torques|torques",
+  "Prevotella[_ ]?copri[_ ]?A|copriA"
+)
+
+# -------------------- LIBRARIES ---------------------------------
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(purrr)
+  library(readr); library(ggplot2); library(stringr)
+  library(forcats); library(scales)
+})
+
+# -------------------- HELPERS ----------------------------------
+maybe_read_xlsx <- function(path){
+  if (!requireNamespace("openxlsx", quietly = TRUE))
+    stop("Input is .xlsx; please install with: install.packages('openxlsx')")
+  openxlsx::read.xlsx(path, sheet = 1, detectDates = FALSE)
+}
+
+normalize_disease <- function(x){
+  x <- trimws(tolower(as.character(x)))
+  dplyr::case_when(
+    x %in% c("crc","case","tumor","cancer") ~ "CRC",
+    x %in% c("control","healthy","normal","hc") ~ "Control",
+    TRUE ~ as.character(x)
+  )
+}
+
+# Keep only s__…; if absent, take last token (e.g., Fusobacterium_nucleatum)
+clean_taxon_name <- function(x){
+  y <- stringr::str_replace_all(x, "\\|", "_")
+  out <- ifelse(stringr::str_detect(y, "s__"),
+                stringr::str_extract(y, "s__[^|_]+(?:_[^|_]+)?"),
+                stringr::word(y, -1, sep = "_"))
+  out <- stringr::str_replace_all(out, "_+", "_")
+  out <- stringr::str_remove(out, "^s__")
+  out
+}
+
+present_rate_any <- function(v) {
+  mean(as.integer(suppressWarnings(as.numeric(v)) > presence_threshold), na.rm = TRUE)
+}
+
+summarise_taxon <- function(dat, tax_col){
+  x  <- suppressWarnings(as.numeric(dat[[tax_col]]))
+  x  <- as.integer(x > presence_threshold)
+  ms <- dat$Ms_present
+  n11 <- sum(ms==1 & x==1, na.rm=TRUE)  # both present
+  n10 <- sum(ms==1 & x==0, na.rm=TRUE)  # only M. smithii
+  n01 <- sum(ms==0 & x==1, na.rm=TRUE)  # only taxon
+  n00 <- sum(ms==0 & x==0, na.rm=TRUE)  # neither
+  mat <- matrix(c(n00,n01,n10,n11), nrow=2)
+  ft  <- tryCatch(stats::fisher.test(mat), error=function(e) NULL)
+  tibble(
+    Taxon = tax_col,
+    n00_none = n00, n10_ms_only = n10, n01_taxon_only = n01, n11_both = n11,
+    total = n00 + n10 + n01 + n11,
+    fisher_p = if (!is.null(ft)) ft$p.value else NA_real_,
+    odds_ratio = if (!is.null(ft) && !is.null(ft$estimate)) as.numeric(ft$estimate) else NA_real_,
+    conf_low = if (!is.null(ft)) ft$conf.int[1] else NA_real_,
+    conf_high = if (!is.null(ft)) ft$conf.int[2] else NA_real_
+  )
+}
+
+# For stacked bars: facet-specific text but stable 4-color legend via pattern_fill
+presence_patterns_for_taxon <- function(dat, tax_col){
+  tax_clean <- clean_taxon_name(tax_col)
+  dat %>%
+    mutate(
+      taxon_present = as.integer(suppressWarnings(as.numeric(.data[[tax_col]])) > presence_threshold),
+      pattern_text = dplyr::case_when(
+        Ms_present==1 & taxon_present==1 ~ "Both present",
+        Ms_present==1 & taxon_present==0 ~ "Only M. smithii",
+        Ms_present==0 & taxon_present==1 ~ paste0("Only ", tax_clean),
+        TRUE ~ "Neither"
+      ),
+      pattern_fill = dplyr::case_when(
+        Ms_present==1 & taxon_present==1 ~ "Both present",
+        Ms_present==1 & taxon_present==0 ~ "Only M. smithii",
+        Ms_present==0 & taxon_present==1 ~ "Only taxon",
+        TRUE ~ "Neither"
+      ),
+      Disease = factor(.data[[Disease_col]], levels=c("Control","CRC"))
+    ) %>%
+    count(Disease, pattern_text, pattern_fill, name="n") %>%
+    group_by(Disease) %>% mutate(prop = n/sum(n)) %>% ungroup() %>%
+    mutate(Taxon = tax_clean)
+}
+
+# Consume-once ordering to avoid duplicated facet levels
+order_by_patterns <- function(patterns, candidates) {
+  hits <- character(0)
+  remain <- candidates
+  for (p in patterns) {
+    idx <- which(stringr::str_detect(tolower(remain), tolower(p)))[1]
+    if (!is.na(idx)) {
+      hits <- c(hits, remain[idx])
+      remain <- remain[-idx]
+    }
+  }
+  c(hits, remain)
+}
+
+# -------------------- LOAD DATA ---------------------------------
+ext <- tolower(tools::file_ext(in_path))
+df0 <- switch(
+  ext,
+  "xlsx" = maybe_read_xlsx(in_path),
+  "xls"  = maybe_read_xlsx(in_path),
+  "csv"  = readr::read_csv(in_path, show_col_types = FALSE),
+  stop("Unsupported file extension: use .xlsx or .csv")
+)
+stopifnot(ncol(df0) >= 4)
+
+Sample_col  <- names(df0)[1]  # Sample IDs
+Disease_col <- names(df0)[2]  # Control/CRC
+Ms_col      <- names(df0)[3]  # M. smithii
+taxa_cols   <- names(df0)[-(1:3)]
+
+df <- df0 %>%
+  mutate(!!Disease_col := normalize_disease(.data[[Disease_col]])) %>%
+  filter(.data[[Disease_col]] %in% c("CRC","Control")) %>%
+  mutate(Ms_present = as.integer(suppressWarnings(as.numeric(.data[[Ms_col]])) > presence_threshold))
+
+# -------------------- FILTER BY PREVALENCE ----------------------
+taxa_cols <- tibble(Taxon = taxa_cols,
+                    prev = purrr::map_dbl(taxa_cols, ~ present_rate_any(df[[.x]]))) %>%
+  filter(prev >= min_prevalence) %>%
+  pull(Taxon)
+if (length(taxa_cols) == 0) stop("No taxa pass min_prevalence; set min_prevalence <- 0.")
+
+# -------------------- ANALYSIS ---------------------------------
+overall <- purrr::map_dfr(taxa_cols, ~ summarise_taxon(df, .x)) %>% mutate(Disease="All")
+
+by_disease <- df %>%
+  split(df[[Disease_col]]) %>%
+  purrr::imap_dfr(~ purrr::map_dfr(taxa_cols, function(tn) summarise_taxon(.x, tn)) %>% mutate(Disease=.y))
+
+out_long <- bind_rows(overall, by_disease) %>%
+  relocate(Disease, Taxon) %>%
+  arrange(Disease, desc(n11_both), desc(total)) %>%
+  group_by(Disease) %>%
+  mutate(fisher_p_adj_BH = p.adjust(fisher_p, method = "BH")) %>%
+  ungroup() %>%
+  mutate(Taxon_clean = clean_taxon_name(Taxon))
+
+# Data for stacked bars
+all_patterns <- purrr::map_dfr(taxa_cols, ~ presence_patterns_for_taxon(df, .x))
+
+# ---------- Facet order (consume-once; no duplicates)
+tax_names <- as.character(unique(all_patterns$Taxon))
+facet_levels <- order_by_patterns(desired_order_patterns, tax_names)
+facet_levels <- unique(facet_levels)
+all_patterns$Taxon <- factor(as.character(all_patterns$Taxon), levels = facet_levels)
+
+# ---------- Annotation: OR [CI] + q (Control & CRC strata only)
+ann_df <- out_long %>%
+  filter(Disease %in% c("Control","CRC")) %>%
+  mutate(
+    Taxon = clean_taxon_name(Taxon),
+    q = fisher_p_adj_BH,
+    q_label = dplyr::case_when(
+      is.na(q) ~ "q=NA",
+      q < 0.001 ~ "q<0.001",
+      TRUE ~ paste0("q=", formatC(q, format = "f", digits = 3))
+    ),
+    OR_label = dplyr::case_when(
+      is.na(odds_ratio) ~ "OR=NA",
+      is.infinite(odds_ratio) ~ "OR=Inf",
+      TRUE ~ paste0(
+        "OR=", formatC(odds_ratio, format = "f", digits = 2),
+        " [", formatC(conf_low, format = "f", digits = 2), "–",
+        formatC(conf_high, format = "f", digits = 2), "]"
+      )
+    ),
+    sig = !is.na(q) & q < 0.05,
+    label = paste0(OR_label, "\n", q_label)
+  ) %>%
+  select(Taxon, Disease, label, sig)
+ann_df$Taxon <- factor(as.character(ann_df$Taxon), levels = facet_levels)
+ann_df$lab_col <- ifelse(ann_df$sig, "#222222", "grey30")
+
+# ---------- Percentage labels only for the first facet
+first_taxon <- levels(all_patterns$Taxon)[1]
+pct_df <- all_patterns %>%
+  filter(Taxon == first_taxon) %>%
+  group_by(Taxon, Disease) %>%
+  arrange(Taxon, Disease, desc(prop)) %>%   # order slices to get consistent stacking for ypos
+  mutate(
+    ypos  = cumsum(prop) - prop/2,
+    label = scales::percent(prop, accuracy = 1)
+  ) %>%
+  ungroup()
+

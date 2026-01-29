@@ -1,0 +1,172 @@
+# ───────────────────────────────────────────────────────
+# Load libraries
+# ───────────────────────────────────────────────────────
+library(vegan)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(tibble)
+
+# ───────────────────────────────────────────────────────
+# Define paths and inputs
+# ───────────────────────────────────────────────────────
+
+taxonomy_files <- list.files(data_dir, pattern = "Kraken2_Bracken_output_species_level_.*\\.txt$", full.names = TRUE)
+metadata_files <- list.files(data_dir, pattern = "metadata_matched_.*\\.txt$", full.names = TRUE)
+project_IDs <- gsub("Bracken_species_level_|\\.txt$", "", basename(taxonomy_files))
+
+# Color scheme
+state_colors <- c("case" = "#E69F00", "Control" = "#999999")
+
+# Initialize result lists
+pcoa_results <- list()
+permanova_results <- list()
+
+# ───────────────────────────────────────────────────────
+# TSS Normalization
+# ───────────────────────────────────────────────────────
+tss_normalize <- function(df) {
+  counts <- df[, -1]
+  norm_counts <- sweep(counts, 1, rowSums(counts, na.rm = TRUE), "/")
+  cbind(SRA_ID = df$SRA_ID, norm_counts)
+}
+
+# ───────────────────────────────────────────────────────
+# Process each dataset
+# ───────────────────────────────────────────────────────
+for (project in project_IDs) {
+  cat("Processing:", project, "\n")
+  
+  tax_file <- file.path(data_dir, paste0("Kraken2_Bracken_output_species_level_", project, ".txt"))
+  meta_file <- file.path(data_dir, paste0("metadata_matched_", project, ".txt"))
+  
+  taxonomy <- read.table(tax_file, header = TRUE, sep = "\t", row.names = 1, stringsAsFactors = FALSE)
+  metadata <- read.table(meta_file, header = TRUE, sep = "\t", stringsAsFactors = FALSE) %>%
+    mutate(SRA_ID = trimws(SRA_ID)) %>%
+    filter(state %in% c("case", "Control")) %>%
+    select(SRA_ID, state)
+  
+  archaea <- taxonomy[grep("^k__Archaea", rownames(taxonomy)), , drop = FALSE]
+  bacteria <- taxonomy[grep("^k__Bacteria", rownames(taxonomy)), , drop = FALSE]
+  
+  archaea <- as.data.frame(t(archaea)) %>% rownames_to_column("SRA_ID") %>% mutate(SRA_ID = trimws(SRA_ID))
+  bacteria <- as.data.frame(t(bacteria)) %>% rownames_to_column("SRA_ID") %>% mutate(SRA_ID = trimws(SRA_ID))
+  
+  common_archaea <- intersect(archaea$SRA_ID, metadata$SRA_ID)
+  common_bacteria <- intersect(bacteria$SRA_ID, metadata$SRA_ID)
+  archaea <- archaea %>% filter(SRA_ID %in% common_archaea)
+  bacteria <- bacteria %>% filter(SRA_ID %in% common_bacteria)
+  meta_archaea <- metadata %>% filter(SRA_ID %in% common_archaea)
+  meta_bacteria <- metadata %>% filter(SRA_ID %in% common_bacteria)
+  
+  archaea <- archaea[rowSums(archaea[, -1], na.rm = TRUE) > 0, ]
+  bacteria <- bacteria[rowSums(bacteria[, -1], na.rm = TRUE) > 0, ]
+  archaea <- archaea[, c(TRUE, apply(archaea[, -1], 2, var, na.rm = TRUE) > 1e-6)]
+  bacteria <- bacteria[, c(TRUE, apply(bacteria[, -1], 2, var, na.rm = TRUE) > 1e-6)]
+  
+  archaea_norm <- tss_normalize(archaea)
+  bacteria_norm <- tss_normalize(bacteria)
+  
+  if (nrow(archaea_norm) > 2) {
+    dist_archaea <- vegdist(archaea_norm[, -1], method = "bray")
+    pcoa_archaea <- cmdscale(dist_archaea, k = 2, eig = TRUE)
+    var_archaea <- round(100 * pcoa_archaea$eig[1:2] / sum(pcoa_archaea$eig), 1)
+    
+    pcoa_df_archaea <- data.frame(
+      SRA_ID = archaea_norm$SRA_ID,
+      Axis1 = pcoa_archaea$points[, 1],
+      Axis2 = pcoa_archaea$points[, 2],
+      dataset = project,
+      var_label = paste0("Axis 1 (", var_archaea[1], "%)\nAxis 2 (", var_archaea[2], "%)")
+    ) %>% left_join(meta_archaea, by = "SRA_ID") %>% select(SRA_ID, Axis1, Axis2, dataset, state, var_label)
+    
+    df_arch <- archaea_norm
+    rownames(df_arch) <- df_arch$SRA_ID
+    df_arch$SRA_ID <- NULL
+    meta_perm <- meta_archaea[match(rownames(df_arch), meta_archaea$SRA_ID), ]
+    ad_arch <- adonis2(df_arch ~ state, data = meta_perm, method = "bray", permutations = 999)
+    
+    pcoa_results[[project]]$archaea <- list(data = pcoa_df_archaea)
+    permanova_results[[project]]$archaea <- ad_arch
+  }
+  
+  if (nrow(bacteria_norm) > 2) {
+    dist_bacteria <- vegdist(bacteria_norm[, -1], method = "bray")
+    pcoa_bacteria <- cmdscale(dist_bacteria, k = 2, eig = TRUE)
+    var_bacteria <- round(100 * pcoa_bacteria$eig[1:2] / sum(pcoa_bacteria$eig), 1)
+    
+    pcoa_df_bacteria <- data.frame(
+      SRA_ID = bacteria_norm$SRA_ID,
+      Axis1 = pcoa_bacteria$points[, 1],
+      Axis2 = pcoa_bacteria$points[, 2],
+      dataset = project,
+      var_label = paste0("Axis 1 (", var_bacteria[1], "%)\nAxis 2 (", var_bacteria[2], "%)")
+    ) %>% left_join(meta_bacteria, by = "SRA_ID") %>% select(SRA_ID, Axis1, Axis2, dataset, state, var_label)
+    
+    df_bact <- bacteria_norm
+    rownames(df_bact) <- df_bact$SRA_ID
+    df_bact$SRA_ID <- NULL
+    meta_perm <- meta_bacteria[match(rownames(df_bact), meta_bacteria$SRA_ID), ]
+    ad_bact <- adonis2(df_bact ~ state, data = meta_perm, method = "bray", permutations = 999)
+    
+    pcoa_results[[project]]$bacteria <- list(data = pcoa_df_bacteria)
+    permanova_results[[project]]$bacteria <- ad_bact
+  }
+}
+
+# Combine and label plots with PERMANOVA results
+archaea_labels <- list()
+bacteria_labels <- list()
+
+for (project in project_IDs) {
+  if (!is.null(permanova_results[[project]]$archaea)) {
+    ad <- permanova_results[[project]]$archaea
+    r2 <- formatC(ad$R2[1], digits = 3, format = "f")
+    pval <- formatC(ad$`Pr(>F)`[1], digits = 3, format = "f")
+    archaea_labels[[project]] <- paste0(project, "\nR² = ", r2, ", p = ", pval)
+  }
+  if (!is.null(permanova_results[[project]]$bacteria)) {
+    ad <- permanova_results[[project]]$bacteria
+    r2 <- formatC(ad$R2[1], digits = 3, format = "f")
+    pval <- formatC(ad$`Pr(>F)`[1], digits = 3, format = "f")
+    bacteria_labels[[project]] <- paste0(project, "\nR² = ", r2, ", p = ", pval)
+  }
+}
+
+pcoa_archaea_all <- bind_rows(lapply(pcoa_results, function(x) if (!is.null(x$archaea)) x$archaea$data)) %>%
+  mutate(dataset_label = archaea_labels[dataset] %>% unlist())
+
+pcoa_bacteria_all <- bind_rows(lapply(pcoa_results, function(x) if (!is.null(x$bacteria)) x$bacteria$data)) %>%
+  mutate(dataset_label = bacteria_labels[dataset] %>% unlist())
+
+# Generate plots with variance explained per facet
+p_pcoa_archaea <- ggplot(pcoa_archaea_all, aes(x = Axis1, y = Axis2, color = state)) +
+  geom_point(alpha = 0.7, size = 0.8) +
+  stat_ellipse() +
+  scale_color_manual(values = state_colors) +
+  facet_wrap(~ dataset_label + var_label, ncol = 5) +
+  labs(
+    title = "PCoA (Bray-Curtis) - Archaea",
+    x = "",
+    y = ""
+  ) +
+  theme_minimal()
+
+p_pcoa_bacteria <- ggplot(pcoa_bacteria_all, aes(x = Axis1, y = Axis2, color = state)) +
+  geom_point(alpha = 0.7, size = 0.8) +
+  stat_ellipse() +
+  scale_color_manual(values = state_colors) +
+  facet_wrap(~ dataset_label + var_label, ncol = 5) +
+  labs(
+    title = "PCoA (Bray-Curtis) - Bacteria",
+    x = "",
+    y = ""
+  ) +
+  theme_minimal()
+
+# Save plots
+ggsave("PCoA_Archaea_with_PERMANOVA.svg", p_pcoa_archaea, width = 12, height = 12, dpi = 500)
+ggsave("PCoA_Bacteria_with_PERMANOVA.svg", p_pcoa_bacteria, width = 12, height = 12, dpi = 500)
+
+# Optional: print PERMANOVA results
+print(p_pcoa_bacteria)

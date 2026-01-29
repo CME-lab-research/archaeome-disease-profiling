@@ -1,0 +1,158 @@
+# Load required libraries
+library(phyloseq)
+library(ggplot2)
+library(vegan)
+library(dplyr)
+library(tidyr)
+
+# Define directory containing files
+data_dir <- "/Volumes/Backup Plus/Archaea_and_disease_paper/01_diseases_bioprojects/08_alpha_beta_diversity_all_plotting/"
+
+# Get taxonomy and metadata files
+taxonomy_files <- list.files(path = data_dir, pattern = "Kraken2_Bracken_output_species_level_.*\\.txt$", full.names = TRUE)
+metadata_files <- list.files(path = data_dir, pattern = "metadata_matched_.*\\.txt$", full.names = TRUE)
+
+# Extract project IDs from filenames
+project_IDs <- gsub("Bracken_species_level_|\\.txt$", "", basename(taxonomy_files))
+
+# Initialize an empty list to store results
+shannon_results <- list()
+
+# Loop through each project ID
+for (project in project_IDs) {
+  
+  taxonomy_file <- file.path(data_dir, paste0("Kraken2_Bracken_output_species_level_", project, ".txt"))
+  metadata_file <- file.path(data_dir, paste0("metadata_matched_", project, ".txt"))
+  
+  # Load metadata
+  metadata <- read.table(metadata_file, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+  if (!"state" %in% colnames(metadata)) stop(paste("Error: 'state' column missing in metadata for", project))
+  
+  # Load taxonomy table
+  taxonomy_table <- read.table(taxonomy_file, header = TRUE, sep = "\t", stringsAsFactors = FALSE, row.names = 1)
+  
+  # Separate Archaea and Bacteria OTUs
+  archaea_table <- taxonomy_table[grep("^k__Archaea", rownames(taxonomy_table)), , drop = FALSE]
+  bacteria_table <- taxonomy_table[grep("^k__Bacteria", rownames(taxonomy_table)), , drop = FALSE]
+  
+  archaea_table <- as.data.frame(t(archaea_table))
+  bacteria_table <- as.data.frame(t(bacteria_table))
+  
+  rownames(metadata) <- metadata$SRA_ID
+  archaea_table <- archaea_table[rowSums(archaea_table) > 0, , drop = FALSE]
+  bacteria_table <- bacteria_table[rowSums(bacteria_table) > 0, , drop = FALSE]
+  
+  archaea_table_filtered <- archaea_table[, colSums(archaea_table) > 0, drop = FALSE]
+  bacteria_table_filtered <- bacteria_table[, colSums(bacteria_table) > 0, drop = FALSE]
+  
+  metadata_filtered_archaea <- metadata[match(rownames(archaea_table_filtered), metadata$SRA_ID), , drop = FALSE]
+  metadata_filtered_bacteria <- metadata[match(rownames(bacteria_table_filtered), metadata$SRA_ID), , drop = FALSE]
+  
+  otu_archaea <- otu_table(as.matrix(archaea_table_filtered), taxa_are_rows = FALSE)
+  otu_bacteria <- otu_table(as.matrix(bacteria_table_filtered), taxa_are_rows = FALSE)
+  
+  sample_data_archaea <- sample_data(metadata_filtered_archaea)
+  sample_data_bacteria <- sample_data(metadata_filtered_bacteria)
+  
+  physeq_archaea <- phyloseq(otu_archaea, sample_data_archaea)
+  physeq_bacteria <- phyloseq(otu_bacteria, sample_data_bacteria)
+  
+  # Calculate the 10th percentile of library sizes for rarefaction
+  min_depth_archaea <- as.numeric(quantile(sample_sums(physeq_archaea), 0.10))
+  min_depth_bacteria <- as.numeric(quantile(sample_sums(physeq_bacteria), 0.10))
+  
+  # Rarefy to the 10th percentile of library sizes
+  physeq_archaea <- rarefy_even_depth(physeq_archaea, sample.size = min_depth_archaea, rngseed = 123, verbose = FALSE)
+  physeq_bacteria <- rarefy_even_depth(physeq_bacteria, sample.size = min_depth_bacteria, rngseed = 123, verbose = FALSE)
+  
+  # Estimate Shannon diversity
+  shannon_archaea <- estimate_richness(physeq_archaea, measures = "Shannon") %>%
+    mutate(SRA_ID = rownames(.)) %>%
+    left_join(metadata_filtered_archaea %>% select(SRA_ID, state), by = "SRA_ID") %>%
+    mutate(dataset = project)
+  
+  shannon_bacteria <- estimate_richness(physeq_bacteria, measures = "Shannon") %>%
+    mutate(SRA_ID = rownames(.)) %>%
+    left_join(metadata_filtered_bacteria %>% select(SRA_ID, state), by = "SRA_ID") %>%
+    mutate(dataset = project)
+  
+  # Calculate p-values
+  p_archaea <- if (length(unique(shannon_archaea$state)) == 2) {
+    wilcox.test(Shannon ~ state, data = shannon_archaea)$p.value
+  } else { NA }
+  
+  p_bacteria <- if (length(unique(shannon_bacteria$state)) == 2) {
+    wilcox.test(Shannon ~ state, data = shannon_bacteria)$p.value
+  } else { NA }
+  
+  shannon_archaea$p_value <- p_archaea
+  shannon_bacteria$p_value <- p_bacteria
+  
+  shannon_results[[project]] <- list(archaea = shannon_archaea, bacteria = shannon_bacteria)
+}
+
+# Combine all results
+shannon_archaea_all <- bind_rows(lapply(shannon_results, `[[`, "archaea")) %>%
+  select(SRA_ID, Shannon, state, dataset, p_value)
+shannon_bacteria_all <- bind_rows(lapply(shannon_results, `[[`, "bacteria")) %>%
+  select(SRA_ID, Shannon, state, dataset, p_value)
+
+shannon_archaea_all$state <- factor(shannon_archaea_all$state, levels = c("case", "Control"))
+shannon_bacteria_all$state <- factor(shannon_bacteria_all$state, levels = c("case", "Control"))
+
+# Summarize p-values for annotation
+pval_archaea_df <- shannon_archaea_all %>%
+  group_by(dataset) %>%
+  summarise(p_value = unique(p_value)) %>%
+  mutate(label = paste0("p = ", signif(p_value, 3)))
+
+pval_bacteria_df <- shannon_bacteria_all %>%
+  group_by(dataset) %>%
+  summarise(p_value = unique(p_value)) %>%
+  mutate(label = paste0("p = ", signif(p_value, 3)))
+
+# Define custom colors and theme
+custom_colors <- c("case" = "#E69F00", "Control" = "#999999")
+custom_theme <- theme(
+  text = element_text(family = "Times New Roman"),
+  plot.title = element_text(face = "bold", size = 14),
+  axis.title.x = element_blank(),
+  axis.title.y = element_text(size = 16),
+  axis.text = element_text(size = 18),
+  legend.text = element_text(size = 12),
+  legend.title = element_text(size = 14),
+  panel.border = element_rect(color = "grey", fill = NA, linewidth = 1),
+  axis.line = element_line(color = "grey", linewidth = 1)
+)
+
+# Plot for archaea
+p_alpha_archaea <- ggplot(shannon_archaea_all, aes(x = state, y = Shannon, fill = state)) +
+  geom_violin(width = 0.9, scale = "width", alpha = 0.7, color = NA) +
+  geom_boxplot(width = 0.4, color = "black", fill = "white", outlier.shape = NA) +
+  geom_jitter(width = 0.3, size = 2, shape = 1, color = "black", stroke = 0.3) +
+  geom_text(data = pval_archaea_df, aes(x = 1.5, y = max(shannon_archaea_all$Shannon, na.rm = TRUE) + 0.2, label = label), inherit.aes = FALSE, size = 4) +
+  scale_fill_manual(values = custom_colors) +
+  scale_y_continuous(expand = expansion(mult = c(0.01, 0.3))) +
+  ggtitle("Alpha Diversity (Shannon) - Archaea") +
+  theme_minimal() + custom_theme +
+  facet_wrap(~ dataset, ncol = 5)
+
+# Plot for bacteria
+p_alpha_bacteria <- ggplot(shannon_bacteria_all, aes(x = state, y = Shannon, fill = state)) +
+  geom_violin(width = 0.9, scale = "width", alpha = 0.7, color = NA) +
+  geom_boxplot(width = 0.4, color = "black", fill = "white", outlier.shape = NA) +
+  geom_jitter(width = 0.3, size = 2, shape = 1, color = "black", stroke = 0.15) +
+  geom_text(data = pval_bacteria_df, aes(x = 1.5, y = max(shannon_bacteria_all$Shannon, na.rm = TRUE) + 0.2, label = label), inherit.aes = FALSE, size = 4) +
+  scale_fill_manual(values = custom_colors) +
+  scale_y_continuous(expand = expansion(mult = c(0.01, 0.3))) +
+  ggtitle("Alpha Diversity (Shannon) - Bacteria") +
+  theme_minimal() + custom_theme +
+  facet_wrap(~ dataset, ncol = 5)
+
+# Display and save plots
+print(p_alpha_archaea)
+print(p_alpha_bacteria)
+
+# Save plots as SVG
+ggsave("Shannon_Alpha_Diversity_Archaea_rarefied.svg", plot = p_alpha_archaea, device = "svg", dpi = 500)
+ggsave("Shannon_Alpha_Diversity_Bacteria_rarefied.svg", plot = p_alpha_bacteria, device = "svg", dpi = 500)
